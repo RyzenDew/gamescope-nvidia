@@ -721,6 +721,11 @@ struct commit_t
 			fb_id = 0;
 		}
 
+		if (release_point != 0)
+		{
+			drmSyncobjTimelineSignal(release_timeline.drm_fd, &release_timeline.handle, &release_point, 1);
+		}
+
 		wlserver_lock();
 		if (!presentation_feedbacks.empty())
 		{
@@ -758,6 +763,9 @@ struct commit_t
 	uint64_t desired_present_time = 0;
 	uint64_t earliest_present_time = 0;
 	uint64_t present_margin = 0;
+
+	struct wlr_render_timeline release_timeline = {};
+	uint64_t release_point = 0;
 };
 
 static std::vector<pollfd> pollfds;
@@ -1081,6 +1089,8 @@ struct WaitListEntry_t
 	bool mangoapp_nudge;
 	uint64_t commitID;
 	uint64_t desiredPresentTime;
+	struct wlr_render_timeline wait_timeline;
+	uint64_t wait_point;
 };
 
 sem waitListSem;
@@ -1120,12 +1130,27 @@ retry:
 
 	assert( bFound == true );
 
+	int timeout_ms = 100;
+
 	gpuvis_trace_begin_ctx_printf( entry.commitID, "wait fence" );
-	struct pollfd fd = { entry.fence, POLLIN, 0 };
-	int ret = poll( &fd, 1, 100 );
-	if ( ret < 0 )
+	if (entry.wait_point != 0)
 	{
-		xwm_log.errorf_errno( "failed to poll fence FD" );
+		uint32_t flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+		uint64_t timeout_ns = (uint64_t)timeout_ms * 1000 * 1000;
+		int ret = drmSyncobjTimelineWait(entry.wait_timeline.drm_fd, &entry.wait_timeline.handle, &entry.wait_point, 1, timeout_ns, flags, nullptr);
+		if (ret < 0)
+		{
+			xwm_log.errorf("failed to wait timeline point");
+		}
+	}
+	else
+	{
+		struct pollfd fd = { entry.fence, POLLIN, 0 };
+		int ret = poll( &fd, 1, timeout_ms );
+		if ( ret < 0 )
+		{
+			xwm_log.errorf_errno( "failed to poll fence FD" );
+		}
 	}
 	gpuvis_trace_end_ctx_printf( entry.commitID, "wait fence" );
 
@@ -1390,7 +1415,7 @@ destroy_buffer( struct wl_listener *listener, void * )
 }
 
 static std::shared_ptr<commit_t>
-import_commit ( struct wlr_surface *surf, struct wlr_buffer *buf, bool async, std::shared_ptr<wlserver_vk_swapchain_feedback> swapchain_feedback, std::vector<struct wl_resource*> presentation_feedbacks, std::optional<uint32_t> present_id, uint64_t desired_present_time )
+import_commit ( struct wlr_surface *surf, struct wlr_buffer *buf, bool async, std::shared_ptr<wlserver_vk_swapchain_feedback> swapchain_feedback, std::vector<struct wl_resource*> presentation_feedbacks, std::optional<uint32_t> present_id, uint64_t desired_present_time, struct wlr_render_timeline release_timeline, uint64_t release_point )
 {
 	std::shared_ptr<commit_t> commit = std::make_shared<commit_t>();
 	std::unique_lock<std::mutex> lock( wlr_buffer_map_lock );
@@ -1403,6 +1428,8 @@ import_commit ( struct wlr_surface *surf, struct wlr_buffer *buf, bool async, st
 		commit->feedback = *swapchain_feedback;
 	commit->present_id = present_id;
 	commit->desired_present_time = desired_present_time;
+	commit->release_timeline = release_timeline;
+	commit->release_point = release_point;
 
 	auto it = wlr_buffer_map.find( buf );
 	if ( it != wlr_buffer_map.end() )
@@ -6559,7 +6586,7 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		return;
 	}
 
-	std::shared_ptr<commit_t> newCommit = import_commit( reslistentry.surf, buf, reslistentry.async, std::move(reslistentry.feedback), std::move(reslistentry.presentation_feedbacks), reslistentry.present_id, reslistentry.desired_present_time );
+	std::shared_ptr<commit_t> newCommit = import_commit( reslistentry.surf, buf, reslistentry.async, std::move(reslistentry.feedback), std::move(reslistentry.presentation_feedbacks), reslistentry.present_id, reslistentry.desired_present_time, reslistentry.release_timeline, reslistentry.release_point );
 
 	int fence = -1;
 	if ( newCommit )
@@ -6588,6 +6615,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 				.mangoapp_nudge = mango_nudge,
 				.commitID = newCommit->commitID,
 				.desiredPresentTime = newCommit->desired_present_time,
+				.wait_timeline = reslistentry.wait_timeline,
+				.wait_point = reslistentry.wait_point,
 			};
 			waitList.push_back( entry );
 		}

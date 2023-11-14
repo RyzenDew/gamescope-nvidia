@@ -33,6 +33,7 @@ extern "C" {
 #include <wlr/util/log.h>
 #include <wlr/xwayland/server.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_linux_explicit_synchronization_v2.h>
 #undef static
 #undef class
 }
@@ -113,9 +114,26 @@ void gamescope_xwayland_server_t::wayland_commit(struct wlr_surface *surf, struc
 			.present_id = wl_surf->present_id,
 			.desired_present_time = wl_surf->desired_present_time,
 		};
+
+		auto sync_v2_state = wlr_linux_explicit_sync_v2_get_surface_state(wlserver.wlr.explicit_sync_v2, surf);
+		if (sync_v2_state != nullptr)
+		{
+			if (sync_v2_state->acquire_timeline != nullptr)
+			{
+				newEntry.wait_timeline = *sync_v2_state->acquire_timeline;
+				newEntry.wait_point = sync_v2_state->acquire_point;
+			}
+			if (sync_v2_state->release_timeline != nullptr)
+			{
+				newEntry.release_timeline = *sync_v2_state->release_timeline;
+				newEntry.release_point = sync_v2_state->release_point;
+			}
+		}
+
 		wl_surf->present_id = std::nullopt;
 		wl_surf->desired_present_time = 0;
 		wl_surf->pending_presentation_feedbacks.clear();
+
 		wayland_commit_queue.push_back( newEntry );
 	}
 
@@ -1378,9 +1396,9 @@ void xdg_surface_new(struct wl_listener *listener, void *data)
 	wlserver_surface->xdg_surface = xdg_surface_info;
 
 	xdg_surface_info->map.notify = xdg_toplevel_map;
-	wl_signal_add(&xdg_surface->events.map, &xdg_surface_info->map);
+	wl_signal_add(&xdg_surface->surface->events.map, &xdg_surface_info->map);
 	xdg_surface_info->unmap.notify = xdg_toplevel_unmap;
-	wl_signal_add(&xdg_surface->events.unmap, &xdg_surface_info->unmap);
+	wl_signal_add(&xdg_surface->surface->events.unmap, &xdg_surface_info->unmap);
 	xdg_surface_info->destroy.notify = xdg_toplevel_destroy;
 	wl_signal_add(&xdg_surface->events.destroy, &xdg_surface_info->destroy);
 
@@ -1438,7 +1456,7 @@ bool wlserver_init( void ) {
 
 	wlr_renderer_init_wl_display(wlserver.wlr.renderer, wlserver.display);
 
-	wlserver.wlr.compositor = wlr_compositor_create(wlserver.display, wlserver.wlr.renderer);
+	wlserver.wlr.compositor = wlr_compositor_create(wlserver.display, 5, wlserver.wlr.renderer);
 
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
@@ -1457,6 +1475,9 @@ bool wlserver_init( void ) {
 	create_gamescope_tearing();
 
 	create_presentation_time();
+
+	int drm_fd = wlr_renderer_get_drm_fd(wlserver.wlr.renderer);
+	wlserver.wlr.explicit_sync_v2 = wlr_linux_explicit_sync_v2_create(wlserver.display, drm_fd);
 
 	wlserver.xdg_shell = wlr_xdg_shell_create(wlserver.display, 3);
 	if (!wlserver.xdg_shell)
